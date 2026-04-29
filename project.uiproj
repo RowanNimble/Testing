@@ -1,0 +1,6 @@
+{
+  "Name": "MultiBranch_Testing",
+  "ProjectType": "Process",
+  "Description": "MultiBranch_Testing",
+  "MainFile": "Main.xaml"
+}
