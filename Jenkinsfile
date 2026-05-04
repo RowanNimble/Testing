@@ -40,15 +40,6 @@ pipeline {
         stage('Determine Branch and Target Environment') {
             steps {
                 script {
-                    /*
-                     * Multibranch variables:
-                     *
-                     * BRANCH_NAME   = branch/job name, e.g. main, feature/x, PR-12
-                     * CHANGE_BRANCH = source branch of PR, e.g. feature/x
-                     * CHANGE_TARGET = target branch of PR, e.g. main
-                     * CHANGE_ID     = PR number
-                     */
-
                     env.SOURCE_BRANCH = env.CHANGE_BRANCH ?: env.BRANCH_NAME
                     env.IS_PR_BUILD = env.CHANGE_ID ? "true" : "false"
 
@@ -99,7 +90,95 @@ pipeline {
             }
         }
 
+        stage('Detect Changed Files') {
+            steps {
+                powershell '''
+                $ErrorActionPreference = "Stop"
+
+                git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main | Out-Null
+
+                $branch = $env:SOURCE_BRANCH
+                $isPr = $env:IS_PR_BUILD
+
+                if ($isPr -eq "true") {
+                    $target = $env:CHANGE_TARGET
+
+                    if ([string]::IsNullOrWhiteSpace($target)) {
+                        $target = "main"
+                    }
+
+                    $files = git diff --name-only "origin/$target...HEAD"
+                }
+                elseif ($branch -eq "main") {
+                    git rev-parse --verify HEAD~1 2>$null | Out-Null
+
+                    if ($LASTEXITCODE -eq 0) {
+                        $files = git diff --name-only HEAD~1 HEAD
+                    }
+                    else {
+                        $files = git ls-files
+                    }
+                }
+                else {
+                    $files = git diff --name-only origin/main...HEAD
+                }
+
+                $files | Out-File -FilePath changed-files.txt -Encoding utf8
+
+                Write-Host "Changed files:"
+                Get-Content changed-files.txt
+                '''
+
+                script {
+                    def changedFiles = readFile('changed-files.txt')
+                        .split(/\r?\n/)
+                        .collect { it.trim().replace('\\', '/') }
+                        .findAll { it }
+
+                    echo "Changed files detected:"
+                    changedFiles.each { echo " - ${it}" }
+
+                    def uipathChanged = changedFiles.any { file ->
+                        file == 'project.json' ||
+                        file.endsWith('.xaml') ||
+                        (file.endsWith('.json') && !file.startsWith('.github/')) ||
+                        file.startsWith('Data/') ||
+                        file.startsWith('Framework/') ||
+                        file.startsWith('Tests/') ||
+                        file.startsWith('Libraries/') ||
+                        file.startsWith('Objects/') ||
+                        file.startsWith('Screenshots/') ||
+                        file.startsWith('Documentation/')
+                    }
+
+                    env.UIPATH_CHANGED = uipathChanged.toString()
+
+                    echo "UIPATH_CHANGED = ${env.UIPATH_CHANGED}"
+
+                    if (env.UIPATH_CHANGED != "true") {
+                        echo """
+                        No UiPath project changes detected.
+
+                        Skipping:
+                        - Validate UiPath Configuration
+                        - Read UiPath Project Metadata
+                        - Build Package
+                        - Deploy
+                        - Run Job
+
+                        Jenkins will still report SUCCESS to GitHub.
+                        """
+                    }
+                }
+            }
+        }
+
         stage('Validate UiPath Configuration') {
+            when {
+                expression {
+                    return env.UIPATH_CHANGED == "true"
+                }
+            }
             steps {
                 powershell '''
                 $ErrorActionPreference = "Stop"
@@ -138,6 +217,11 @@ pipeline {
         }
 
         stage('Read UiPath Project Metadata') {
+            when {
+                expression {
+                    return env.UIPATH_CHANGED == "true"
+                }
+            }
             steps {
                 powershell '''
                 $ErrorActionPreference = "Stop"
@@ -168,6 +252,11 @@ pipeline {
         }
 
         stage('Build Package') {
+            when {
+                expression {
+                    return env.UIPATH_CHANGED == "true"
+                }
+            }
             steps {
                 UiPathPack (
                     outputPath: env.OUTPUT_DIR,
@@ -180,6 +269,11 @@ pipeline {
         }
 
         stage('Check Package') {
+            when {
+                expression {
+                    return env.UIPATH_CHANGED == "true"
+                }
+            }
             steps {
                 bat '''
                 @echo off
@@ -209,7 +303,7 @@ pipeline {
         stage('Deploy to DEV') {
             when {
                 expression {
-                    return env.TARGET_ENV == "DEV"
+                    return env.UIPATH_CHANGED == "true" && env.TARGET_ENV == "DEV"
                 }
             }
             steps {
@@ -235,7 +329,7 @@ pipeline {
         stage('Run DEV Job') {
             when {
                 expression {
-                    return env.TARGET_ENV == "DEV"
+                    return env.UIPATH_CHANGED == "true" && env.TARGET_ENV == "DEV"
                 }
             }
             steps {
@@ -265,7 +359,7 @@ pipeline {
         stage('Deploy to TEST') {
             when {
                 expression {
-                    return env.TARGET_ENV == "TEST"
+                    return env.UIPATH_CHANGED == "true" && env.TARGET_ENV == "TEST"
                 }
             }
             steps {
@@ -291,7 +385,7 @@ pipeline {
         stage('Run TEST Job') {
             when {
                 expression {
-                    return env.TARGET_ENV == "TEST"
+                    return env.UIPATH_CHANGED == "true" && env.TARGET_ENV == "TEST"
                 }
             }
             steps {
@@ -324,12 +418,13 @@ pipeline {
             echo """
             Pipeline successful.
 
-            Branch:  ${env.SOURCE_BRANCH}
-            Target:  ${env.TARGET_ENV}
-            Project: ${env.PROJECT_NAME}
-            Version: ${env.PACKAGE_VERSION}
-            Folder:  ${env.ORCH_FOLDER}
-            Package: ${env.PACKAGE_PATH}
+            Branch:         ${env.SOURCE_BRANCH}
+            Target:         ${env.TARGET_ENV}
+            UiPath changed: ${env.UIPATH_CHANGED}
+            Project:        ${env.PROJECT_NAME ?: 'N/A'}
+            Version:        ${env.PACKAGE_VERSION}
+            Folder:         ${env.ORCH_FOLDER}
+            Package:        ${env.PACKAGE_PATH ?: 'N/A'}
             """
         }
 
@@ -337,8 +432,9 @@ pipeline {
             echo """
             Pipeline failed.
 
-            Branch: ${env.SOURCE_BRANCH ?: env.BRANCH_NAME}
-            Target: ${env.TARGET_ENV ?: 'unknown'}
+            Branch:         ${env.SOURCE_BRANCH ?: env.BRANCH_NAME}
+            Target:         ${env.TARGET_ENV ?: 'unknown'}
+            UiPath changed: ${env.UIPATH_CHANGED ?: 'unknown'}
             """
         }
 
